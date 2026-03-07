@@ -401,13 +401,22 @@ class AICore(ABC, Generic[TAiResponse]):
             )
 
     def _debug_log(self, message: str) -> None:
-        """Print a debug log line when debug mode is enabled."""
+        """Print a debug log line when debug mode is enabled.
+
+        Parameters:
+                message: Debug text payload to emit.
+        """
         if not getattr(self.config, "debug_enabled", False):
             return
         print(f"[AICore DEBUG] {message}")
 
     def _shorten_for_debug(self, text: str, max_len: int = 240) -> str:
-        """Return shortened debug-safe text for logs."""
+        """Return shortened debug-safe text for logs.
+
+        Parameters:
+                text: Source text to shorten for compact logging.
+                max_len: Maximum output length before appending ellipsis.
+        """
         if len(text) <= max_len:
             return text
         return text[:max_len] + "..."

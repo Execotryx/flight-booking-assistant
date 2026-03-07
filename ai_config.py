@@ -144,7 +144,12 @@ class AIConfig:
             self._values[key] = self._normalize_value(key, raw_value)
 
     def _normalize_value(self, key: str, raw_value: Any) -> Any:
-        """Normalize and validate one configuration value by key."""
+        """Normalize and validate one configuration value by key.
+
+        Parameters:
+            key: Logical configuration key to normalize.
+            raw_value: Raw value from environment, overrides, or defaults.
+        """
         if key == "openai_api_key":
             return str(raw_value)
 
@@ -181,14 +186,23 @@ class AIConfig:
         raise ValueError(f"Unsupported config key: {key}")
 
     def _to_bool(self, value: Any) -> bool:
-        """Convert accepted bool-like values to bool."""
+        """Convert accepted bool-like values to bool.
+
+        Parameters:
+            value: Raw value to interpret as boolean.
+        """
         if isinstance(value, bool):
             return value
         normalized_value = str(value).strip().lower()
         return normalized_value in {"1", "true", "yes", "on"}
 
     def _to_int(self, value: Any, key: str) -> int:
-        """Convert value to int and raise a key-specific error on failure."""
+        """Convert value to int and raise a key-specific error on failure.
+
+        Parameters:
+                value: Raw value expected to be integer-compatible.
+                key: Logical configuration key used in validation errors.
+        """
         try:
             return int(value)
         except (TypeError, ValueError) as exc:
