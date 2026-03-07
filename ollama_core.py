@@ -28,10 +28,8 @@ Example:
         print(answer)
 """
 
-from typing import Any
-
 from ai_config import AIConfig
-from ai_core import AICore
+from ai_core import AICore, CompletionCallConfiguration
 from openai.types.chat.chat_completion import ChatCompletion
 
 
@@ -84,13 +82,15 @@ class OllamaAICore(AICore[str]):
         self._max_tokens: int | None = max_tokens
         super().__init__(config=resolved_config, system_behavior=system_behavior)
 
-    def _form_call_configuration(self, request: str) -> dict[str, Any]:
+    def _form_call_configuration(self, request: str) -> CompletionCallConfiguration:
         """Build the Ollama chat completion call configuration.
 
         Parameters:
                 request: User input text for the current turn.
         """
-        call_configuration: dict[str, Any] = super()._form_call_configuration(request)
+        call_configuration: CompletionCallConfiguration = super()._form_call_configuration(
+            request
+        )
         if self._model_name is not None:
             call_configuration["model"] = self._model_name
         if self._temperature is not None:

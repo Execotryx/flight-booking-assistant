@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import gradio as gr
 
 from flight_booking_agent import FlightTicketBookingAgent
@@ -13,7 +11,10 @@ def create_chatbot() -> gr.ChatInterface:
     """Create the Gradio chat interface bound to one agent instance."""
     agent = FlightTicketBookingAgent()
 
-    def respond(message: str, history: list[Any]) -> str:
+    def respond(
+        message: str,
+        history: list[tuple[str, str]],
+    ) -> str:
         """Handle one chat turn from Gradio and return assistant text.
 
         Parameters:

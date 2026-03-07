@@ -4,8 +4,8 @@ import json
 import openai
 from abc import ABC, abstractmethod
 from ai_config import AIConfig
-from collections.abc import Iterator
-from typing import Any, Callable, Generic, TypeVar
+from collections.abc import Iterable, Iterator
+from typing import Any, Callable, Generic, TypedDict, TypeVar, cast
 from openai.types.chat.chat_completion import ChatCompletion
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 from openai.types.chat import (
@@ -17,7 +17,44 @@ from openai.types.chat import (
     ChatCompletionAssistantMessageParam,
 )
 
-TAiResponse = TypeVar("TAiResponse", default=Any)
+TAiResponse = TypeVar("TAiResponse", default=object)
+
+
+class ToolFunctionSchema(TypedDict):
+    """Function-specific schema payload for model tool registration."""
+
+    name: str
+    description: str
+    parameters: dict[str, object]
+
+
+class ToolSchema(TypedDict):
+    """Tool schema payload accepted by chat completion tool-calling."""
+
+    type: str
+    function: ToolFunctionSchema
+
+
+ToolHandler = Callable[..., object]
+
+
+class OpenAIClientKwargs(TypedDict, total=False):
+    """Supported keyword arguments for OpenAI client construction in this project."""
+
+    api_key: str
+    base_url: str
+
+
+class CompletionCallConfiguration(TypedDict, total=False):
+    """Subset of chat completion options used by this project."""
+
+    model: str
+    messages: list[ChatCompletionMessageParam]
+    tools: list[ToolSchema]
+    tool_choice: str
+    temperature: float
+    max_tokens: int
+
 SUMMARY_PREFIX: str = "Conversation memory summary (auto-generated):"
 SUMMARIZER_SYSTEM_PROMPT: str = (
     "You are a conversation summarizer. Summarize prior user-assistant exchanges "
@@ -44,7 +81,7 @@ class HistoryManager:
         pairs: list[tuple[int, int]] = []
         pending_user_idx: int | None = None
         for index in range(1, len(self._messages)):
-            message_role: Any = self._messages[index].get("role")
+            message_role = self._messages[index].get("role")
             if message_role == "user":
                 pending_user_idx = index
             elif message_role == "assistant" and pending_user_idx is not None:
@@ -115,20 +152,20 @@ class AICore(ABC, Generic[TAiResponse]):
         self._history_manager: HistoryManager = HistoryManager(system_behavior)
 
         # Allow base_url override for local Ollama/vLLM endpoints
-        client_kwargs: dict[str, Any] = {"api_key": self.config.openai_api_key}
+        client_kwargs: OpenAIClientKwargs = {"api_key": self.config.openai_api_key}
         if hasattr(self.config, "base_url") and self.config.base_url:
             client_kwargs["base_url"] = self.config.base_url
 
         self._ai_api_client: openai.OpenAI = openai.OpenAI(**client_kwargs)
-        self._tool_schemas: list[dict[str, Any]] = []
-        self._tool_handlers: dict[str, Callable[..., Any]] = {}
+        self._tool_schemas: list[ToolSchema] = []
+        self._tool_handlers: dict[str, ToolHandler] = {}
 
     def register_tool(
         self,
         name: str,
         description: str,
-        parameters: dict[str, Any],
-        handler: Callable[..., Any],
+        parameters: dict[str, object],
+        handler: ToolHandler,
     ) -> None:
         """Register a callable tool for model-driven function calling.
 
@@ -138,7 +175,7 @@ class AICore(ABC, Generic[TAiResponse]):
                 parameters: JSON-schema object describing accepted arguments.
                 handler: Python callable executed when the tool is invoked.
         """
-        tool_schema: dict[str, Any] = {
+        tool_schema: ToolSchema = {
             "type": "function",
             "function": {
                 "name": name,
@@ -148,7 +185,7 @@ class AICore(ABC, Generic[TAiResponse]):
         }
 
         for index, existing_tool in enumerate(self._tool_schemas):
-            function_payload: dict[str, Any] = existing_tool.get("function", {})
+            function_payload = existing_tool.get("function", {})
             if function_payload.get("name") == name:
                 self._tool_schemas[index] = tool_schema
                 self._tool_handlers[name] = handler
@@ -191,10 +228,12 @@ class AICore(ABC, Generic[TAiResponse]):
 
         retry_count: int = 0
         while True:
-            call_configuration: dict[str, Any] = self._form_call_configuration(request)
+            call_configuration: CompletionCallConfiguration = self._form_call_configuration(
+                request
+            )
             try:
                 stream = self._ai_api.chat.completions.create(
-                    **call_configuration,
+                    **cast(dict[str, Any], call_configuration),
                     stream=True,
                 )
 
@@ -252,7 +291,9 @@ class AICore(ABC, Generic[TAiResponse]):
         """
         retry_count: int = 0
         while True:
-            call_configuration: dict[str, Any] = self._form_call_configuration(request)
+            call_configuration: CompletionCallConfiguration = self._form_call_configuration(
+                request
+            )
             try:
                 return self._execute_completion_with_tools(call_configuration)
             except Exception as exc:
@@ -263,7 +304,7 @@ class AICore(ABC, Generic[TAiResponse]):
                 retry_count += 1
 
     def _execute_completion_with_tools(
-        self, initial_call_configuration: dict[str, Any]
+        self, initial_call_configuration: CompletionCallConfiguration
     ) -> ChatCompletion:
         """Execute one model turn including optional tool-call follow-up rounds.
 
@@ -277,31 +318,61 @@ class AICore(ABC, Generic[TAiResponse]):
 
         tool_round_count: int = 0
         while True:
-            tool_calls: list[Any] = self._extract_tool_calls(response)
-            if not tool_calls:
-                self._debug_log(
-                    f"answer.finalized without tool calls after {tool_round_count} round(s)"
-                )
+            response, tool_round_count, finalized = self._run_tool_call_round(
+                response=response,
+                tool_round_count=tool_round_count,
+            )
+            if finalized:
                 return response
 
+    def _run_tool_call_round(
+        self,
+        response: ChatCompletion,
+        tool_round_count: int,
+    ) -> tuple[ChatCompletion, int, bool]:
+        """Execute one tool-call round and return next response state.
+
+        Parameters:
+                response: Current model response to inspect for tool calls.
+                tool_round_count: Number of completed tool rounds.
+        """
+        tool_calls: list[object] = self._extract_tool_calls(response)
+        if not tool_calls:
             self._debug_log(
-                f"answer.tool_round={tool_round_count + 1} tool_call_count={len(tool_calls)}"
+                f"answer.finalized without tool calls after {tool_round_count} round(s)"
             )
-            self._append_assistant_tool_call_message(response)
-            self._append_tool_results_to_history(tool_calls)
-            tool_round_count += 1
+            return response, tool_round_count, True
 
-            if tool_round_count >= self.config.max_tool_call_rounds:
-                raise RuntimeError(
-                    "Tool-calling exceeded maximum rounds "
-                    f"({self.config.max_tool_call_rounds})."
-                )
+        self._debug_log(
+            f"answer.tool_round={tool_round_count + 1} tool_call_count={len(tool_calls)}"
+        )
+        self._append_assistant_tool_call_message(response, tool_calls)
+        self._append_tool_results_to_history(tool_calls)
 
-            follow_up_configuration: dict[str, Any] = self._form_call_configuration("")
-            response = self._complete_once(follow_up_configuration)
-            self._debug_log(f"answer.round={tool_round_count} completed")
+        next_round_count = tool_round_count + 1
+        self._raise_if_tool_round_limit_reached(next_round_count)
 
-    def _complete_once(self, call_configuration: dict[str, Any]) -> ChatCompletion:
+        follow_up_configuration: CompletionCallConfiguration = self._form_call_configuration(
+            ""
+        )
+        next_response = self._complete_once(follow_up_configuration)
+        self._debug_log(f"answer.round={next_round_count} completed")
+        return next_response, next_round_count, False
+
+    def _raise_if_tool_round_limit_reached(self, tool_round_count: int) -> None:
+        """Raise when tool-calling exceeds configured safety round limit.
+
+        Parameters:
+                tool_round_count: Count after completing the current round.
+        """
+        if tool_round_count < self.config.max_tool_call_rounds:
+            return
+        raise RuntimeError(
+            "Tool-calling exceeded maximum rounds "
+            f"({self.config.max_tool_call_rounds})."
+        )
+
+    def _complete_once(self, call_configuration: CompletionCallConfiguration) -> ChatCompletion:
         """Run a single completion call.
 
         Parameters:
@@ -309,11 +380,11 @@ class AICore(ABC, Generic[TAiResponse]):
         """
         if self._tool_schemas:
             return self._ai_api.chat.completions.create(
-                **call_configuration,
+                **cast(dict[str, Any], call_configuration),
             )
         return self._stream_completion(call_configuration)
 
-    def _extract_tool_calls(self, response: ChatCompletion) -> list[Any]:
+    def _extract_tool_calls(self, response: ChatCompletion) -> list[object]:
         """Extract tool calls from the first assistant choice in a response.
 
         Parameters:
@@ -321,84 +392,152 @@ class AICore(ABC, Generic[TAiResponse]):
         """
         if not response.choices:
             return []
-        message: Any = response.choices[0].message
-        raw_tool_calls: Any = getattr(message, "tool_calls", None)
+        message = response.choices[0].message
+        raw_tool_calls: object = getattr(message, "tool_calls", None)
         if raw_tool_calls is None:
+            return []
+        if not isinstance(raw_tool_calls, Iterable):
             return []
         return list(raw_tool_calls)
 
-    def _append_assistant_tool_call_message(self, response: ChatCompletion) -> None:
+    def _append_assistant_tool_call_message(
+        self,
+        response: ChatCompletion,
+        tool_calls: list[object],
+    ) -> None:
         """Persist assistant tool-call request message to history.
 
         Parameters:
                 response: Completion response containing tool calls.
+                tool_calls: Already extracted tool call objects for this response.
         """
         if not response.choices:
             return
-        message: Any = response.choices[0].message
-        tool_calls_payload: list[ChatCompletionMessageToolCallParam] = []
-        for tool_call in self._extract_tool_calls(response):
-            function_payload: Any = getattr(tool_call, "function", None)
-            tool_call_payload: ChatCompletionMessageToolCallParam = {
-                "id": str(getattr(tool_call, "id", "")),
-                "type": "function",
-                "function": {
-                    "name": str(getattr(function_payload, "name", "")),
-                    "arguments": str(getattr(function_payload, "arguments", "{}")),
-                },
-            }
-            tool_calls_payload.append(tool_call_payload)
+        message = response.choices[0].message
+        tool_calls_payload = self._build_tool_calls_payload(tool_calls)
+        assistant_message = self._build_assistant_tool_call_history_message(
+            message=message,
+            tool_calls_payload=tool_calls_payload,
+        )
+        self.history_manager.add_message(assistant_message)
 
-        assistant_content: Any = getattr(message, "content", None)
+    def _build_tool_calls_payload(
+        self,
+        tool_calls: list[object],
+    ) -> list[ChatCompletionMessageToolCallParam]:
+        """Convert tool call objects from response into history payload format.
+
+        Parameters:
+                tool_calls: Tool call objects extracted from completion output.
+        """
+        payload: list[ChatCompletionMessageToolCallParam] = []
+        for tool_call in tool_calls:
+            payload.append(self._tool_call_to_payload(tool_call))
+        return payload
+
+    def _tool_call_to_payload(
+        self,
+        tool_call: object,
+    ) -> ChatCompletionMessageToolCallParam:
+        """Convert a single tool-call object into serializable typed payload.
+
+        Parameters:
+                tool_call: Provider tool call object from completion output.
+        """
+        function_payload: object = getattr(tool_call, "function", None)
+        return {
+            "id": str(getattr(tool_call, "id", "")),
+            "type": "function",
+            "function": {
+                "name": str(getattr(function_payload, "name", "")),
+                "arguments": str(getattr(function_payload, "arguments", "{}")),
+            },
+        }
+
+    def _build_assistant_tool_call_history_message(
+        self,
+        message: object,
+        tool_calls_payload: list[ChatCompletionMessageToolCallParam],
+    ) -> ChatCompletionAssistantMessageParam:
+        """Build assistant history message carrying tool call request payload.
+
+        Parameters:
+                message: Assistant message object from completion choice.
+                tool_calls_payload: Converted tool call payload list for history.
+        """
+        assistant_content: object = getattr(message, "content", None)
         if assistant_content is None:
-            assistant_message_no_content: ChatCompletionAssistantMessageParam = {
+            return {
                 "role": "assistant",
                 "tool_calls": tool_calls_payload,
             }
-            self.history_manager.add_message(
-                assistant_message_no_content
-            )
-            return
 
-        assistant_message_with_content: ChatCompletionAssistantMessageParam = {
+        return {
             "role": "assistant",
             "content": self._content_to_text(assistant_content),
             "tool_calls": tool_calls_payload,
         }
-        self.history_manager.add_message(
-            assistant_message_with_content
-        )
 
-    def _append_tool_results_to_history(self, tool_calls: list[Any]) -> None:
+    def _append_tool_results_to_history(self, tool_calls: list[object]) -> None:
         """Execute requested tools and append their outputs to conversation history.
 
         Parameters:
                 tool_calls: Tool call objects requested by the model.
         """
         for tool_call in tool_calls:
-            function_payload: Any = getattr(tool_call, "function", None)
-            tool_name: str = str(getattr(function_payload, "name", ""))
-            raw_arguments: str = str(getattr(function_payload, "arguments", "{}"))
+            tool_name, raw_arguments = self._extract_tool_call_invocation(tool_call)
             self._debug_log(f"tool.request name={tool_name} args={raw_arguments}")
-
-            parsed_arguments: Any
-            try:
-                parsed_arguments = json.loads(raw_arguments) if raw_arguments else {}
-            except json.JSONDecodeError as exc:
-                parsed_arguments = {}
-                tool_result: str = f"Invalid tool arguments JSON: {exc}"
-            else:
-                tool_result = self._execute_registered_tool(tool_name, parsed_arguments)
-
-            tool_message: ChatCompletionToolMessageParam = {
-                "role": "tool",
-                "tool_call_id": str(getattr(tool_call, "id", "")),
-                "content": tool_result,
-            }
+            tool_result = self._run_tool_call(tool_name, raw_arguments)
+            tool_message: ChatCompletionToolMessageParam = self._build_tool_result_message(
+                tool_call=tool_call,
+                tool_result=tool_result,
+            )
             self.history_manager.add_message(tool_message)
             self._debug_log(
                 f"tool.response name={tool_name} content={self._shorten_for_debug(tool_result)}"
             )
+
+    def _extract_tool_call_invocation(self, tool_call: object) -> tuple[str, str]:
+        """Extract tool name and raw JSON argument string from tool call object.
+
+        Parameters:
+                tool_call: Provider tool call object from completion output.
+        """
+        function_payload: object = getattr(tool_call, "function", None)
+        tool_name = str(getattr(function_payload, "name", ""))
+        raw_arguments = str(getattr(function_payload, "arguments", "{}"))
+        return tool_name, raw_arguments
+
+    def _run_tool_call(self, tool_name: str, raw_arguments: str) -> str:
+        """Parse tool arguments and execute the registered handler.
+
+        Parameters:
+                tool_name: Tool/function name from the model output.
+                raw_arguments: JSON argument text from tool call.
+        """
+        parsed_arguments: object
+        try:
+            parsed_arguments = json.loads(raw_arguments) if raw_arguments else {}
+        except json.JSONDecodeError as exc:
+            return f"Invalid tool arguments JSON: {exc}"
+        return self._execute_registered_tool(tool_name, parsed_arguments)
+
+    def _build_tool_result_message(
+        self,
+        tool_call: object,
+        tool_result: str,
+    ) -> ChatCompletionToolMessageParam:
+        """Build one tool-result history message for follow-up completion round.
+
+        Parameters:
+                tool_call: Provider tool call object that requested execution.
+                tool_result: Serialized tool execution output text.
+        """
+        return {
+            "role": "tool",
+            "tool_call_id": str(getattr(tool_call, "id", "")),
+            "content": tool_result,
+        }
 
     def _debug_log(self, message: str) -> None:
         """Print a debug log line when debug mode is enabled.
@@ -421,20 +560,20 @@ class AICore(ABC, Generic[TAiResponse]):
             return text
         return text[:max_len] + "..."
 
-    def _execute_registered_tool(self, tool_name: str, arguments: Any) -> str:
+    def _execute_registered_tool(self, tool_name: str, arguments: object) -> str:
         """Run one registered tool handler and return serialized text output.
 
         Parameters:
                 tool_name: Registered tool/function name.
                 arguments: Parsed JSON arguments object.
         """
-        handler: Callable[..., Any] | None = self._tool_handlers.get(tool_name)
+        handler: ToolHandler | None = self._tool_handlers.get(tool_name)
         if handler is None:
             return f"Tool '{tool_name}' is not registered."
 
         try:
             if isinstance(arguments, dict):
-                result: Any = handler(**arguments)
+                result: object = handler(**arguments)
             else:
                 result = handler(arguments)
         except Exception as exc:
@@ -460,21 +599,24 @@ class AICore(ABC, Generic[TAiResponse]):
             retry_count < self.config.compaction_max_retries
         )
 
-    def _stream_completion(self, call_configuration: dict[str, Any]) -> ChatCompletion:
+    def _stream_completion(
+        self,
+        call_configuration: CompletionCallConfiguration,
+    ) -> ChatCompletion:
         """Execute a streamed completion call and rebuild it as ChatCompletion.
 
         Parameters:
                 call_configuration: Completion call options excluding stream mode.
         """
         stream = self._ai_api.chat.completions.create(
-            **call_configuration,
+            **cast(dict[str, Any], call_configuration),
             stream=True,
         )
 
         assistant_text: str = self._collect_streamed_assistant_text(stream)
         return self._build_chat_completion_from_text(assistant_text)
 
-    def _collect_streamed_assistant_text(self, stream: Any) -> str:
+    def _collect_streamed_assistant_text(self, stream: Iterator[ChatCompletionChunk]) -> str:
         """Collect all assistant delta fragments from a streaming iterator.
 
         Parameters:
@@ -732,7 +874,7 @@ class AICore(ABC, Generic[TAiResponse]):
             or "too many tokens" in exc_text
         )
 
-    def _content_to_text(self, content: Any) -> str:
+    def _content_to_text(self, content: object) -> str:
         """Convert OpenAI message content variants into plain text.
 
         Parameters:
@@ -756,13 +898,13 @@ class AICore(ABC, Generic[TAiResponse]):
         return str(content)
 
     @abstractmethod
-    def _form_call_configuration(self, request: str) -> dict[str, Any]:
+    def _form_call_configuration(self, request: str) -> CompletionCallConfiguration:
         """Build the API call configuration for the current request.
 
         Parameters:
                 request: User input text for the current turn.
         """
-        call_configuration: dict[str, Any] = {
+        call_configuration: CompletionCallConfiguration = {
             "model": self.config.model_name,
             "messages": self.history_manager.messages,
         }
