@@ -1,54 +1,73 @@
 # Flight Ticket Assistant
 
-Domain-focused flight ticket booking assistant powered by Ollama-compatible chat models, with tool calling, CLI mode, and Gradio UI.
+Flight-only booking assistant built on an Ollama-compatible OpenAI API stack.
 
-## Highlights
+Current implementation includes:
+- Dual-model architecture (reasoning + answering).
+- Tool calling for flight search and booking operations.
+- Deterministic fallback handling for common follow-up intents to avoid tool-loop dead ends.
+- CLI and Gradio interfaces.
 
-- Strict domain scope: answers only flight-booking and flight-travel questions.
-- Two-model routing:
-	- Reasoning/classification model: `lfm2.5-thinking:1.2b-q8_0`
-	- Answering/tool model: `smollm2:latest`
-- Tool-calling flow for realistic booking actions:
-	- search flights
-	- quote fare
-	- create booking
-	- fetch booking
-	- cancel booking
-- Conversation history support with optional pair compaction/summarization.
-- Two interfaces:
-	- Terminal chat (`--ui cli`)
-	- Web chat via Gradio (`--ui gradio`)
+## Current Models
 
----
+- Reasoning model: `lfm2.5-thinking:1.2b-q8_0`
+- Answer model: `granite4:3b`
 
-## Project Structure
+`AIConfig.model_name` still exists and defaults to `smollm2:latest`, but `FlightTicketBookingAgent` overrides model names per core.
 
-- `ai_config.py`: environment-driven runtime configuration.
-- `ai_core.py`: generic core for chat orchestration, history, compaction, and tool-calling loop.
-- `ollama_core.py`: concrete `AICore` implementation for Ollama OpenAI-compatible endpoints.
-- `flight_booking_agent.py`: domain agent, prompts, in-memory flight/booking data, and tool handlers.
-- `gradio_app.py`: Gradio chat interface wrapper around the booking agent.
-- `main.py`: single entrypoint with CLI flags to select UI mode.
+## Project Layout
 
----
+- `ai_config.py`: validated environment/override config, debug and tool-loop controls.
+- `ai_core.py`: typed chat orchestration core, tool-call loop, history compaction/summarization.
+- `ollama_core.py`: Ollama-specific `AICore` implementation.
+- `flight_booking_agent.py`: booking domain logic, prompts, tools, and deterministic follow-up handlers.
+- `gradio_app.py`: web UI wrapper.
+- `main.py`: entrypoint with `--ui` selection.
+
+## Features
+
+- Strict domain scope: flight booking and flight travel only.
+- Reasoning gate plus keyword fallback for routing.
+- Tool-grounded responses for prices, IDs, and availability.
+- In-memory flights and bookings with create/get/cancel lifecycle.
+- Natural-language date normalization.
+- Follow-up robustness for prompts like:
+  - "same origin/destination, but a later date"
+  - "what flights from London are available currently"
+- Performance-oriented optimizations:
+  - Precompiled regex and static lookup maps.
+  - Route/date index for flight searches.
+  - Slotted `Flight` dataclass.
+  - Reduced duplicate tool-call extraction work in core.
+
+## Tools Exposed to the Answer Model
+
+- `get_current_system_date()`
+- `resolve_travel_date(date_expression)`
+- `search_flights(origin, destination, date)`
+  - Returns `flights` plus `next_available_dates`.
+- `list_available_flights(origin?, destination?, earliest_date?, limit?)`
+  - Used for broader availability discovery and alternatives.
+- `quote_fare(flight_id, cabin_class)`
+- `create_booking(flight_id, passenger_name, cabin_class)`
+- `get_booking(booking_id)`
+- `cancel_booking(booking_id)`
 
 ## Requirements
 
 - Python `>= 3.13`
-- [uv](https://docs.astral.sh/uv/) for dependency management
-- Ollama running locally (default endpoint `http://localhost:11434/v1`)
-- Required Ollama models pulled:
-	- `lfm2.5-thinking:1.2b-q8_0`
-	- `smollm2:latest`
+- `uv`
+- Ollama running at `http://localhost:11434/v1` (default fallback)
+- Pulled models:
+  - `lfm2.5-thinking:1.2b-q8_0`
+  - `granite4:3b`
 
-Example pulls:
+Example:
 
 ```bash
 ollama pull lfm2.5-thinking:1.2b-q8_0
-ollama pull smollm2:latest
+ollama pull granite4:3b
 ```
-
----
 
 ## Installation
 
@@ -56,23 +75,22 @@ ollama pull smollm2:latest
 uv sync
 ```
 
----
-
 ## Configuration
 
-Set environment variables (optionally via `.env`):
+Use environment variables or `.env`:
 
 ```env
-# Required by AIConfig
-MODEL_NAME=smollm2:latest
-
-# Optional for local Ollama (default fallback is this URL inside OllamaAICore)
+OPENAI_API_KEY=dummy
 OPENAI_BASE_URL=http://localhost:11434/v1
 
-# Optional (dummy is fine for local Ollama)
-OPENAI_API_KEY=dummy
+# Baseline config value (agent overrides per-core model names)
+MODEL_NAME=smollm2:latest
 
-# Optional history/tool behavior
+# Optional diagnostics
+AI_DEBUG_ENABLED=false
+AI_DEBUG_INCLUDE_PROMPTS=false
+
+# Optional history/tool settings
 PAIR_COMPACTION_ENABLED=true
 MAX_PAIRS_BEFORE_COMPACTION=12
 PAIRS_TO_KEEP_RECENT=4
@@ -80,120 +98,46 @@ COMPACTION_MAX_RETRIES=1
 MAX_TOOL_CALL_ROUNDS=8
 ```
 
-Notes:
+## Run
 
-- `MODEL_NAME` is still required by `AIConfig`, but per-core model overrides are used in the booking agent:
-	- reasoning core uses `lfm2.5-thinking:1.2b-q8_0`
-	- answer core uses `smollm2:latest`
-
----
-
-## Running
-
-Use `main.py` as the unified entrypoint.
-
-### CLI mode (default)
-
-```bash
-uv run main.py
-```
-
-or explicitly:
+CLI mode:
 
 ```bash
 uv run main.py --ui cli
 ```
 
-### Gradio web UI
+Gradio mode:
 
 ```bash
 uv run main.py --ui gradio
 ```
 
-Gradio will print a local URL (typically `http://127.0.0.1:7860`).
+## Agent Behavior Summary
 
----
+1. User message is classified by reasoning model.
+2. If in-domain, answer model handles request with tools.
+3. Tool outputs are fed back through the loop until finalized.
+4. For specific follow-up intents (later date/current availability), deterministic handlers may answer directly from current state and tool output to prevent repeated failed loops.
 
-## How the Agent Works
+## Example Flow
 
-1. User message arrives.
-2. Reasoning model classifies message as either:
-	 - `FLIGHT_RELATED`
-	 - `NOT_FLIGHT_RELATED`
-3. If not flight-related, agent refuses with a short domain-safe response.
-4. If flight-related, answering model handles the request with tool calling.
-5. Tool results are fed back into the model until a final response is produced.
+- User: "I want to book a ticket from London"
+- Assistant: asks for missing fields.
+- User: "Paris, two days from today, V. Perepletkina, business"
+- Assistant: resolves date, searches, quotes, creates booking.
+- User: "same origin and destination, but a later date"
+- Assistant: lists available alternatives instead of repeating failed query.
 
-The system prompt for the answering model explicitly restricts scope and requires tool-grounded claims for flights/prices/bookings.
+## Limitations
 
----
-
-## Available Tools
-
-### `search_flights(origin, destination, date)`
-
-- Inputs:
-	- `origin` (IATA/city code style, normalized to uppercase)
-	- `destination`
-	- `date` (`YYYY-MM-DD`)
-- Output: matching flights with fares and seats left.
-
-### `quote_fare(flight_id, cabin_class)`
-
-- Cabin classes:
-	- `economy`
-	- `premium_economy`
-	- `business`
-- Output: base fare and final fare.
-
-### `create_booking(flight_id, passenger_name, cabin_class)`
-
-- Creates a booking if seats are available.
-- Returns booking record including `booking_id` and paid fare.
-
-### `get_booking(booking_id)`
-
-- Returns booking details or `not_found` response.
-
-### `cancel_booking(booking_id)`
-
-- Cancels existing booking and releases one seat back to inventory.
-
----
-
-## Sample Questions
-
-- "Find flights from NYC to LON on 2026-03-20"
-- "Quote business fare for FL-1002"
-- "Book FL-1002 for Alex Johnson in economy"
-- "Get booking BK-1234ABCD"
-- "Cancel booking BK-1234ABCD"
-
-Off-topic example:
-
-- "Explain Python decorators"
-
-Expected behavior: refusal with redirection to flight-booking assistance.
-
----
+- Inventory is in memory and resets each run.
+- No persistence/auth/payments/external airline APIs.
+- Availability reflects only seeded sample flights.
 
 ## Troubleshooting
 
-- **Model not found**
-	- Pull required models in Ollama and retry.
-- **Connection errors to model API**
-	- Confirm Ollama server is running.
-	- Verify `OPENAI_BASE_URL` points to your Ollama API.
-- **No response / unexpected refusals**
-	- Ensure reasoning model is available; if reasoning call fails, classifier defaults to non-flight.
-- **Tool-call loops exceeded**
-	- Increase `MAX_TOOL_CALL_ROUNDS` if needed, but keep it bounded.
-
----
-
-## Development Notes
-
-- The booking data is in-memory only and resets each run.
-- The agent is intentionally strict and minimal by design.
-- If you extend tools, keep system prompts and tool schemas aligned to preserve domain safety.
+- Model errors: ensure both models are pulled in Ollama.
+- Connection errors: verify Ollama is running and `OPENAI_BASE_URL` is correct.
+- Frequent refusals: enable debug flags and verify reasoning model availability.
+- Tool-round limit reached: review prompts/tool schemas and adjust `MAX_TOOL_CALL_ROUNDS` conservatively.
 
