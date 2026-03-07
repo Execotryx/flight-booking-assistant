@@ -168,10 +168,13 @@ class AICore(ABC, Generic[TAiResponse]):
         Parameters:
                 request: User input text for the current turn.
         """
+        if self.config.debug_enabled and getattr(self.config, "debug_include_prompts", False):
+            self._debug_log(f"ask.request={request}")
         self._add_user_message(request)
         self._compact_history_if_needed(force=False)
         response: ChatCompletion = self._execute_with_compaction_retry(request)
         self._append_assistant_message_from_response(response)
+        self._debug_log("ask.completed")
         return self._process_response(response)
 
     def ask_stream(self, request: str) -> Iterator[str]:
@@ -268,6 +271,7 @@ class AICore(ABC, Generic[TAiResponse]):
                 initial_call_configuration: Initial completion call options.
         """
         response: ChatCompletion = self._complete_once(initial_call_configuration)
+        self._debug_log("answer.round=0 completed")
         if not self._tool_schemas:
             return response
 
@@ -275,8 +279,14 @@ class AICore(ABC, Generic[TAiResponse]):
         while True:
             tool_calls: list[Any] = self._extract_tool_calls(response)
             if not tool_calls:
+                self._debug_log(
+                    f"answer.finalized without tool calls after {tool_round_count} round(s)"
+                )
                 return response
 
+            self._debug_log(
+                f"answer.tool_round={tool_round_count + 1} tool_call_count={len(tool_calls)}"
+            )
             self._append_assistant_tool_call_message(response)
             self._append_tool_results_to_history(tool_calls)
             tool_round_count += 1
@@ -289,6 +299,7 @@ class AICore(ABC, Generic[TAiResponse]):
 
             follow_up_configuration: dict[str, Any] = self._form_call_configuration("")
             response = self._complete_once(follow_up_configuration)
+            self._debug_log(f"answer.round={tool_round_count} completed")
 
     def _complete_once(self, call_configuration: dict[str, Any]) -> ChatCompletion:
         """Run a single completion call.
@@ -337,7 +348,6 @@ class AICore(ABC, Generic[TAiResponse]):
                 },
             }
             tool_calls_payload.append(tool_call_payload)
-            )
 
         assistant_content: Any = getattr(message, "content", None)
         if assistant_content is None:
@@ -369,6 +379,7 @@ class AICore(ABC, Generic[TAiResponse]):
             function_payload: Any = getattr(tool_call, "function", None)
             tool_name: str = str(getattr(function_payload, "name", ""))
             raw_arguments: str = str(getattr(function_payload, "arguments", "{}"))
+            self._debug_log(f"tool.request name={tool_name} args={raw_arguments}")
 
             parsed_arguments: Any
             try:
@@ -385,6 +396,21 @@ class AICore(ABC, Generic[TAiResponse]):
                 "content": tool_result,
             }
             self.history_manager.add_message(tool_message)
+            self._debug_log(
+                f"tool.response name={tool_name} content={self._shorten_for_debug(tool_result)}"
+            )
+
+    def _debug_log(self, message: str) -> None:
+        """Print a debug log line when debug mode is enabled."""
+        if not getattr(self.config, "debug_enabled", False):
+            return
+        print(f"[AICore DEBUG] {message}")
+
+    def _shorten_for_debug(self, text: str, max_len: int = 240) -> str:
+        """Return shortened debug-safe text for logs."""
+        if len(text) <= max_len:
+            return text
+        return text[:max_len] + "..."
 
     def _execute_registered_tool(self, tool_name: str, arguments: Any) -> str:
         """Run one registered tool handler and return serialized text output.

@@ -13,8 +13,13 @@ def create_chatbot() -> gr.ChatInterface:
     """Create the Gradio chat interface bound to one agent instance."""
     agent = FlightTicketBookingAgent()
 
-    def respond(message: str, history: list[dict[str, Any]]) -> str:
-        """Handle one chat turn from Gradio and return assistant text."""
+    def respond(message: str, history: list[Any]) -> str:
+        """Handle one chat turn from Gradio and return assistant text.
+
+        Parameters:
+            message: Current user message from the chat input.
+            history: Prior chat turns supplied by Gradio.
+        """
         _ = history
         return agent.ask(message)
 
@@ -25,14 +30,13 @@ def create_chatbot() -> gr.ChatInterface:
             "Specialized assistant for flight booking only. "
             "Model routing: reasoning=lfm2.5-thinking:1.2b-q8_0, answering=smollm2:latest"
         ),
-        type="messages",
     )
 
 
 def run_gradio() -> None:
     """Launch the Gradio chat application."""
     app = create_chatbot()
-    app.launch()
+    app.launch(inbrowser=True)
 
 
 if __name__ == "__main__":

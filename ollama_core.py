@@ -59,9 +59,25 @@ class OllamaAICore(AICore[str]):
                 temperature: Optional temperature override for response randomness.
                 max_tokens: Optional completion length cap.
         """
-        resolved_config: AIConfig = config if config is not None else AIConfig()
-        if not resolved_config.base_url:
-            resolved_config._base_url = "http://localhost:11434/v1"
+        if config is None:
+            resolved_config = AIConfig(
+                overrides={"base_url": "http://localhost:11434/v1"}
+            )
+        elif config.base_url:
+            resolved_config = config
+        else:
+            resolved_config = AIConfig(
+                overrides={
+                    "openai_api_key": config.openai_api_key,
+                    "model_name": config.model_name,
+                    "base_url": "http://localhost:11434/v1",
+                    "pair_compaction_enabled": config.pair_compaction_enabled,
+                    "max_pairs_before_compaction": config.max_pairs_before_compaction,
+                    "pairs_to_keep_recent": config.pairs_to_keep_recent,
+                    "compaction_max_retries": config.compaction_max_retries,
+                    "max_tool_call_rounds": config.max_tool_call_rounds,
+                }
+            )
 
         self._model_name: str | None = model_name
         self._temperature: float | None = temperature
