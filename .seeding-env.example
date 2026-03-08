@@ -3,3 +3,5 @@ SUPABASE_URL=https://your-project-ref.supabase.co
 SUPABASE_KEY=your_supabase_key
 SUPABASE_TABLE=flights
 SUPABASE_LOOKUP_TABLE=city_code_lookup
+SUPABASE_BOOKINGS_TABLE=bookings
+SUPABASE_RESULT_CACHE_SIZE=5

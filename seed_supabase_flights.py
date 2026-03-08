@@ -25,9 +25,9 @@ import urllib.request
 
 from dotenv import dotenv_values, load_dotenv
 
-DEFAULT_SEEDING_ENV_FILE = ".seeding-env"
-DEFAULT_TABLE = "flights"
-DEFAULT_LOOKUP_TABLE = "city_code_lookup"
+DEFAULT_SEEDING_ENV_FILE: str = ".seeding-env"
+DEFAULT_TABLE: str = "flights"
+DEFAULT_LOOKUP_TABLE: str = "city_code_lookup"
 
 SEED_FLIGHTS: list[dict[str, object]] = [
     {

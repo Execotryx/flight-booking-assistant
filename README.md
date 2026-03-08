@@ -1,54 +1,58 @@
 # Flight Ticket Assistant
 
-Flight-only booking assistant built on an Ollama-compatible OpenAI API stack.
+A flight-only booking assistant that uses an Ollama-compatible API and tool calling.
 
-Current implementation includes:
-- Dual-model architecture (reasoning + answering).
-- Tool calling for flight search and booking operations.
-- Deterministic fallback handling for common follow-up intents to avoid tool-loop dead ends.
-- CLI and Gradio interfaces.
+The assistant is domain-restricted to flight booking and travel tasks. It can search flights, quote fares, create/cancel bookings, and answer follow-up questions using live tool data from Supabase.
 
-## Current Models
+## What It Does
+
+- Routes requests through a strict flight-domain classifier.
+- Uses tool-calling for grounded answers (no invented availability, prices, or booking IDs).
+- Supports deterministic handling for common follow-ups such as:
+  - "what flights from London are available"
+  - "same route, but later date"
+- Provides both CLI and Gradio interfaces.
+
+## Current Model Configuration
 
 - Reasoning model: `lfm2.5-thinking:1.2b-q8_0`
-- Answer model: `granite4:3b`
+- Answer model: `lfm2.5-thinking:1.2b-q8_0`
 
-`AIConfig.model_name` still exists and defaults to `smollm2:latest`, but `FlightTicketBookingAgent` overrides model names per core.
+Note: `AIConfig.model_name` still exists as a base config field, but `FlightTicketBookingAgent` sets model names explicitly.
 
-## Project Layout
+## Architecture Overview
 
-- `ai_config.py`: validated environment/override config, debug and tool-loop controls.
-- `ai_core.py`: typed chat orchestration core, tool-call loop, history compaction/summarization.
-- `ollama_core.py`: Ollama-specific `AICore` implementation.
-- `flight_booking_agent.py`: booking domain logic, prompts, tools, and deterministic follow-up handlers.
-- `gradio_app.py`: web UI wrapper.
-- `main.py`: entrypoint with `--ui` selection.
+- `flight_booking_agent.py`
+  - Domain prompts and routing
+  - Tool registration and handlers
+  - Date/location normalization
+  - Response cleanup (for example, removing stray `<response>...</response>` wrappers)
+  - Supabase-backed booking/flight operations
+- `SupabaseClient` (inside `flight_booking_agent.py`)
+  - Encapsulates REST calls and network diagnostics
+- `ai_core.py` and `ollama_core.py`
+  - Tool-calling loop and Ollama-compatible API integration
+- `main.py` and `gradio_app.py`
+  - CLI and Gradio entry points
 
-## Features
+## Data Source
 
-- Strict domain scope: flight booking and flight travel only.
-- Reasoning gate plus keyword fallback for routing.
-- Tool-grounded responses for prices, IDs, and availability.
-- In-memory flights and bookings with create/get/cancel lifecycle.
-- Natural-language date normalization.
-- Follow-up robustness for prompts like:
-  - "same origin/destination, but a later date"
-  - "what flights from London are available currently"
-- Performance-oriented optimizations:
-  - Precompiled regex and static lookup maps.
-  - Route/date index for flight searches.
-  - Slotted `Flight` dataclass.
-  - Reduced duplicate tool-call extraction work in core.
+The assistant reads and writes flight data in Supabase tables:
 
-## Tools Exposed to the Answer Model
+- Flights table (default: `flights`)
+- City lookup table (default: `city_code_lookup`)
+- Bookings table (default: `bookings`)
+
+It also keeps a small in-memory response cache for recent tool results (default size: `5`, configurable).
+
+## Tools Available to the Model
 
 - `get_current_system_date()`
 - `resolve_travel_date(date_expression)`
 - `search_flights(origin, destination, date)`
-  - Returns `flights` plus `next_available_dates`.
 - `list_available_flights(origin?, destination?, earliest_date?, limit?)`
-  - Used for broader availability discovery and alternatives.
 - `quote_fare(flight_id, cabin_class)`
+- `get_flight_by_id(flight_id)`
 - `create_booking(flight_id, passenger_name, cabin_class)`
 - `get_booking(booking_id)`
 - `cancel_booking(booking_id)`
@@ -57,87 +61,99 @@ Current implementation includes:
 
 - Python `>= 3.13`
 - `uv`
-- Ollama running at `http://localhost:11434/v1` (default fallback)
-- Pulled models:
-  - `lfm2.5-thinking:1.2b-q8_0`
-  - `granite4:3b`
+- Ollama (or compatible OpenAI-style endpoint)
+- Supabase project with seeded tables
 
-Example:
+Recommended model pull:
 
 ```bash
 ollama pull lfm2.5-thinking:1.2b-q8_0
-ollama pull granite4:3b
 ```
 
-## Installation
+## Setup
+
+1. Install dependencies:
 
 ```bash
 uv sync
 ```
 
-## Configuration
+2. Configure environment:
 
-Use environment variables or `.env`:
+- Copy `.env.example` to `.env`
+- Optionally copy `.seeding-env.example` to `.seeding-env` for seeding scripts
+
+Minimum runtime variables:
 
 ```env
 OPENAI_API_KEY=dummy
 OPENAI_BASE_URL=http://localhost:11434/v1
 
-# Baseline config value (agent overrides per-core model names)
-MODEL_NAME=smollm2:latest
+SUPABASE_URL=https://<your-project-ref>.supabase.co
+SUPABASE_KEY=<your-supabase-key>
+```
 
-# Optional diagnostics
+Optional Supabase table and cache settings:
+
+```env
+SUPABASE_TABLE=flights
+SUPABASE_LOOKUP_TABLE=city_code_lookup
+SUPABASE_BOOKINGS_TABLE=bookings
+SUPABASE_RESULT_CACHE_SIZE=5
+```
+
+Optional debug flags:
+
+```env
 AI_DEBUG_ENABLED=false
 AI_DEBUG_INCLUDE_PROMPTS=false
-
-# Optional history/tool settings
-PAIR_COMPACTION_ENABLED=true
-MAX_PAIRS_BEFORE_COMPACTION=12
-PAIRS_TO_KEEP_RECENT=4
-COMPACTION_MAX_RETRIES=1
-MAX_TOOL_CALL_ROUNDS=8
 ```
+
+## Seed Supabase (Optional but Recommended)
+
+Use the included assets:
+
+- `seed_supabase_flights.sql`
+- `seed_supabase_flights.py`
+
+If your tables are empty, seed before running so flight search and booking flows have data.
 
 ## Run
 
-CLI mode:
+CLI:
 
 ```bash
 uv run main.py --ui cli
 ```
 
-Gradio mode:
+Gradio:
 
 ```bash
 uv run main.py --ui gradio
 ```
 
-## Agent Behavior Summary
+## Example Conversation
 
-1. User message is classified by reasoning model.
-2. If in-domain, answer model handles request with tools.
-3. Tool outputs are fed back through the loop until finalized.
-4. For specific follow-up intents (later date/current availability), deterministic handlers may answer directly from current state and tool output to prevent repeated failed loops.
-
-## Example Flow
-
-- User: "I want to book a ticket from London"
-- Assistant: asks for missing fields.
-- User: "Paris, two days from today, V. Perepletkina, business"
-- Assistant: resolves date, searches, quotes, creates booking.
-- User: "same origin and destination, but a later date"
-- Assistant: lists available alternatives instead of repeating failed query.
-
-## Limitations
-
-- Inventory is in memory and resets each run.
-- No persistence/auth/payments/external airline APIs.
-- Availability reflects only seeded sample flights.
+1. User: "What flights from London are available?"
+2. Assistant: lists matching flights.
+3. User: "At what date is FL-3001 departing?"
+4. Assistant: resolves flight by ID via tool and returns departure date/time.
 
 ## Troubleshooting
 
-- Model errors: ensure both models are pulled in Ollama.
-- Connection errors: verify Ollama is running and `OPENAI_BASE_URL` is correct.
-- Frequent refusals: enable debug flags and verify reasoning model availability.
-- Tool-round limit reached: review prompts/tool schemas and adjust `MAX_TOOL_CALL_ROUNDS` conservatively.
+- No model response:
+  - Ensure Ollama/service is running and `OPENAI_BASE_URL` is reachable.
+- Supabase errors:
+  - Verify `SUPABASE_URL` and `SUPABASE_KEY`.
+  - Ensure URL project ref matches key ref.
+- Empty results for known cities:
+  - Confirm `city_code_lookup` has expected city-to-IATA rows.
+- Gradio launches but no debug text in UI:
+  - Debug logs print to server stdout, not chat bubbles.
+
+## Current Limitations
+
+- No auth/payment integration.
+- No external airline APIs.
+- Availability depends on data in your Supabase tables.
 

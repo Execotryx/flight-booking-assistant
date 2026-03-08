@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import gradio as gr
 
-from flight_booking_agent import FlightTicketBookingAgent
+from flight_booking_agent import (
+    ANSWER_MODEL_NAME,
+    REASONING_MODEL_NAME,
+    FlightTicketBookingAgent,
+)
 
 
 def create_chatbot() -> gr.ChatInterface:
@@ -29,7 +33,8 @@ def create_chatbot() -> gr.ChatInterface:
         title="Flight Ticket Booking Agent",
         description=(
             "Specialized assistant for flight booking only. "
-            "Model routing: reasoning=lfm2.5-thinking:1.2b-q8_0, answering=smollm2:latest"
+            f"Model routing: reasoning={REASONING_MODEL_NAME}, "
+            f"answering={ANSWER_MODEL_NAME}"
         ),
     )
 
