@@ -1,0 +1,5 @@
+# Copy this file to .seeding-env and set real values.
+SUPABASE_URL=https://your-project-ref.supabase.co
+SUPABASE_KEY=your_supabase_key
+SUPABASE_TABLE=flights
+SUPABASE_LOOKUP_TABLE=city_code_lookup
