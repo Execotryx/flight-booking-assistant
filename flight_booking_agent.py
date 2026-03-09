@@ -20,6 +20,8 @@ from dotenv import dotenv_values
 from ai_config import AIConfig
 from ollama_core import OllamaAICore
 
+#region Constants and configuration
+
 REASONING_MODEL_NAME: str = "lfm2.5-thinking:1.2b-q8_0"
 ANSWER_MODEL_NAME: str = REASONING_MODEL_NAME
 
@@ -105,6 +107,10 @@ TRAILING_ORIGIN_FILLER_WORDS: frozenset[str] = frozenset(
     }
 )
 
+#endregion
+
+#region Prompts
+
 REASONING_SYSTEM_PROMPT: str = """
 You are a strict routing classifier.
 Task: classify whether a user request is related to flight travel or airline ticket booking.
@@ -152,6 +158,9 @@ Booking behavior:
 - Never claim a booking is confirmed unless the booking tool returns a booking_id.
 """.strip()
 
+#endregion
+
+#region Type definitions for structured data used in tools and Supabase communication
 
 class BookingRecord(TypedDict):
     """Stored booking payload for confirmed/cancelled reservations."""
@@ -314,6 +323,7 @@ class SupabaseSettings(TypedDict):
     bookings_table: str
     result_cache_size: int
 
+#endregion
 
 class SupabaseClient:
     """Encapsulate Supabase REST communication and transport-level diagnostics."""
@@ -499,6 +509,8 @@ class SupabaseClient:
         return None
 
 
+#region Tool templates with handler name references for dynamic binding during registration
+
 TOOL_TEMPLATES: tuple[ToolTemplate, ...] = (
     {
         "name": "get_current_system_date",
@@ -632,12 +644,20 @@ TOOL_TEMPLATES: tuple[ToolTemplate, ...] = (
     },
 )
 
+#endregion
 
 class FlightTicketBookingAgent:
     """Domain-restricted booking assistant powered by OllamaAICore."""
 
+    #region Lifecycle and tool registration methods
+
     def __init__(self, config: AIConfig | None = None) -> None:
-        """Initialize reasoning and answer models with Supabase-backed state."""
+        """Initialize agent models, Supabase client, and in-memory state.
+
+        Parameters:
+            config: Optional runtime AI configuration used for both reasoning and
+                answering cores. When omitted, default AIConfig behavior is used.
+        """
         self._reasoning_core = self._create_reasoning_core(config)
         self._answer_core = self._create_answer_core(config)
 
@@ -655,6 +675,11 @@ class FlightTicketBookingAgent:
         self._register_tools()
 
     def _create_reasoning_core(self, config: AIConfig | None) -> OllamaAICore:
+        """Create the low-temperature routing/classification model wrapper.
+
+        Parameters:
+            config: Optional AI runtime configuration passed into OllamaAICore.
+        """
         return OllamaAICore(
             config=config,
             system_behavior=REASONING_SYSTEM_PROMPT,
@@ -664,6 +689,11 @@ class FlightTicketBookingAgent:
         )
 
     def _create_answer_core(self, config: AIConfig | None) -> OllamaAICore:
+        """Create the answer-generation model wrapper with booking system prompt.
+
+        Parameters:
+            config: Optional AI runtime configuration passed into OllamaAICore.
+        """
         return OllamaAICore(
             config=config,
             system_behavior=BOOKING_SYSTEM_PROMPT,
@@ -671,6 +701,11 @@ class FlightTicketBookingAgent:
         )
 
     def _load_supabase_settings(self) -> SupabaseSettings:
+        """Resolve Supabase settings from environment and validate required values.
+
+        The method reads values first from process environment variables, then
+        falls back to `.seeding-env` for local development defaults.
+        """
         seeding_file_values = dotenv_values(DEFAULT_SEEDING_ENV_FILE)
 
         base_url = str(
@@ -723,6 +758,12 @@ class FlightTicketBookingAgent:
         }
 
     def _parse_positive_int(self, value: object, fallback: int) -> int:
+        """Parse a positive integer with fallback for invalid or non-positive input.
+
+        Parameters:
+            value: Raw value to parse as an integer.
+            fallback: Value returned when parsing fails or result is <= 0.
+        """
         try:
             parsed = int(str(value).strip())
         except (TypeError, ValueError):
@@ -730,6 +771,7 @@ class FlightTicketBookingAgent:
         return parsed if parsed > 0 else fallback
 
     def _register_tools(self) -> None:
+        """Register all booking tools on the answer core from templates."""
         for tool_definition in self._tool_definitions():
             self._answer_core.register_tool(
                 name=tool_definition["name"],
@@ -739,6 +781,7 @@ class FlightTicketBookingAgent:
             )
 
     def _tool_definitions(self) -> tuple[ToolDefinition, ...]:
+        """Resolve tool templates into concrete tool definitions with bound handlers."""
         resolved: list[ToolDefinition] = []
         for template in TOOL_TEMPLATES:
             resolved.append(
@@ -754,7 +797,19 @@ class FlightTicketBookingAgent:
             )
         return tuple(resolved)
 
+    #endregion
+
+    #region Public conversation entrypoint methods
+
     def ask(self, user_input: str) -> str:
+        """Handle one user turn and return the final assistant response.
+
+        This method applies routing checks, deterministic follow-up handlers for
+        availability intents, and tool-enabled LLM response generation.
+
+        Parameters:
+            user_input: Raw text entered by the end user.
+        """
         is_flight_related = self._is_flight_related(user_input)
         if not self._should_allow_request(is_flight_related):
             self._debug_log("routing=NOT_FLIGHT_RELATED (blocked)")
@@ -777,33 +832,112 @@ class FlightTicketBookingAgent:
         self._debug_log(f"answer={self._shorten_for_debug(answer)}")
         return answer
 
-    def _sanitize_answer_output(self, answer: str) -> str:
-        """Normalize model output and remove accidental wrapper tags.
+    #endregion
+
+    #region Request routing and domain classification methods
+
+    def _should_allow_request(self, is_flight_related: bool) -> bool:
+        """Decide whether a request is allowed within current conversation state.
 
         Parameters:
-            answer: Raw answer text returned by the answering model.
+            is_flight_related: Whether the current request was classified as
+                flight-related.
         """
-        cleaned = answer.strip()
-        response_match = re.search(
-            r"<response>\s*(.*?)\s*</response>",
-            cleaned,
-            flags=re.IGNORECASE | re.DOTALL,
+        return is_flight_related or self._booking_flow_active
+
+    def _update_booking_flow_state(self, is_flight_related: bool) -> None:
+        """Update internal booking-flow state after routing classification.
+
+        Parameters:
+            is_flight_related: Whether the current request is in domain scope.
+        """
+        if is_flight_related:
+            self._booking_flow_active = True
+
+    def _is_flight_related(self, text: str) -> bool:
+        """Classify user text as flight-related using reasoning core plus fallback.
+
+        Parameters:
+            text: User-provided message to classify.
+        """
+        classification_prompt = self._build_classification_prompt(text)
+        if (
+            self._answer_core.config.debug_enabled
+            and self._answer_core.config.debug_include_prompts
+        ):
+            self._debug_log(f"reasoning.prompt={classification_prompt}")
+        try:
+            decision = self._get_reasoning_decision(classification_prompt)
+        except Exception:
+            self._debug_log("reasoning.error=classification call failed")
+            return self._keyword_fallback_is_flight_related(text)
+
+        return self._resolve_routing_decision(decision, text)
+
+    def _build_classification_prompt(self, text: str) -> str:
+        """Build the strict routing prompt sent to the reasoning model.
+
+        Parameters:
+            text: User request text inserted into classifier prompt.
+        """
+        return (
+            "Classify this user request. Return exactly FLIGHT_RELATED or "
+            f"NOT_FLIGHT_RELATED.\n\nUser request:\n{text}"
         )
-        if response_match is not None:
-            wrapped_content = response_match.group(1).strip()
-            if wrapped_content:
-                return wrapped_content
 
-            cleaned = re.sub(
-                r"</?response>",
-                "",
-                cleaned,
-                flags=re.IGNORECASE,
-            ).strip()
+    def _get_reasoning_decision(self, classification_prompt: str) -> str:
+        """Execute the routing classifier and normalize its decision label.
 
-        return cleaned
+        Parameters:
+            classification_prompt: Fully composed prompt for routing model.
+        """
+        decision_raw = self._reasoning_core.ask(classification_prompt).strip()
+        decision = decision_raw.upper()
+        self._debug_log(f"reasoning.decision_raw={decision}")
+        return decision
+
+    def _resolve_routing_decision(self, decision: str, text: str) -> bool:
+        """Resolve classifier output into final allow/deny routing decision.
+
+        Parameters:
+            decision: Upper-cased classifier output from reasoning model.
+            text: Original user text used by keyword fallback logic.
+        """
+        if "NOT_FLIGHT_RELATED" in decision:
+            if self._keyword_fallback_is_flight_related(text):
+                self._debug_log("reasoning.overridden_by_keyword_fallback=true")
+                return True
+            return False
+
+        if "FLIGHT_RELATED" in decision:
+            return True
+
+        return self._keyword_fallback_is_flight_related(text)
+
+    def _keyword_fallback_is_flight_related(self, text: str) -> bool:
+        """Infer flight relevance from keywords and IATA-like token heuristics.
+
+        Parameters:
+            text: User request to evaluate when classifier output is uncertain.
+        """
+        lowered = text.lower()
+        if any(keyword in lowered for keyword in FLIGHT_KEYWORDS):
+            return True
+
+        tokens = [token.strip(".,!?()[]{}") for token in text.split()]
+        iata_like_tokens = [token for token in tokens if len(token) == 3 and token.isalpha()]
+        return len(iata_like_tokens) >= 2
+
+    #endregion
+
+    #region Deterministic follow-up and response formatting methods
 
     def _maybe_handle_availability_follow_up(self, user_input: str) -> str | None:
+        """Handle specific follow-up intents without another model call.
+
+        Parameters:
+            user_input: Latest user message used to detect availability intents.
+        """
         lowered = user_input.lower()
         if not self._booking_flow_active:
             return None
@@ -818,6 +952,7 @@ class FlightTicketBookingAgent:
         return None
 
     def _format_later_date_follow_up(self) -> str:
+        """Build a response with later-date options from the last search context."""
         if self._last_search_context is None:
             return "Please share origin, destination, and date so I can suggest later options."
 
@@ -836,6 +971,11 @@ class FlightTicketBookingAgent:
         )
 
     def _format_current_availability_follow_up(self, origin: str | None) -> str:
+        """Build a response with currently available flights.
+
+        Parameters:
+            origin: Optional origin hint extracted from user follow-up text.
+        """
         availability = self._tool_list_available_flights(
             origin=origin,
             destination=None,
@@ -859,6 +999,11 @@ class FlightTicketBookingAgent:
         )
 
     def _extract_origin_hint(self, user_text: str) -> str | None:
+        """Extract an origin hint from user text using phrase and IATA patterns.
+
+        Parameters:
+            user_text: Raw user follow-up text.
+        """
         lowered = user_text.lower()
         match = ORIGIN_HINT_PATTERN.search(lowered)
         if match is not None:
@@ -889,6 +1034,12 @@ class FlightTicketBookingAgent:
         availability: ListAvailableFlightsToolResult,
         empty_message: str,
     ) -> str:
+        """Format list-availability tool output into user-facing bullet lines.
+
+        Parameters:
+            availability: Structured availability data from tool calls.
+            empty_message: Fallback message returned when no flights are present.
+        """
         flights = availability["flights"]
         if not flights:
             return empty_message
@@ -904,70 +1055,35 @@ class FlightTicketBookingAgent:
             )
         return "\n".join(lines)
 
-    def _should_allow_request(self, is_flight_related: bool) -> bool:
-        return is_flight_related or self._booking_flow_active
+    def _sanitize_answer_output(self, answer: str) -> str:
+        """Normalize model output and remove accidental wrapper tags.
 
-    def _update_booking_flow_state(self, is_flight_related: bool) -> None:
-        if is_flight_related:
-            self._booking_flow_active = True
-
-    def _is_flight_related(self, text: str) -> bool:
-        classification_prompt = self._build_classification_prompt(text)
-        if (
-            self._answer_core.config.debug_enabled
-            and self._answer_core.config.debug_include_prompts
-        ):
-            self._debug_log(f"reasoning.prompt={classification_prompt}")
-        try:
-            decision = self._get_reasoning_decision(classification_prompt)
-        except Exception:
-            self._debug_log("reasoning.error=classification call failed")
-            return self._keyword_fallback_is_flight_related(text)
-
-        return self._resolve_routing_decision(decision, text)
-
-    def _build_classification_prompt(self, text: str) -> str:
-        return (
-            "Classify this user request. Return exactly FLIGHT_RELATED or "
-            f"NOT_FLIGHT_RELATED.\n\nUser request:\n{text}"
+        Parameters:
+            answer: Raw answer text returned by the answering model.
+        """
+        cleaned = answer.strip()
+        response_match = re.search(
+            r"<response>\s*(.*?)\s*</response>",
+            cleaned,
+            flags=re.IGNORECASE | re.DOTALL,
         )
+        if response_match is not None:
+            wrapped_content = response_match.group(1).strip()
+            if wrapped_content:
+                return wrapped_content
 
-    def _get_reasoning_decision(self, classification_prompt: str) -> str:
-        decision_raw = self._reasoning_core.ask(classification_prompt).strip()
-        decision = decision_raw.upper()
-        self._debug_log(f"reasoning.decision_raw={decision}")
-        return decision
+            cleaned = re.sub(
+                r"</?response>",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            ).strip()
 
-    def _resolve_routing_decision(self, decision: str, text: str) -> bool:
-        if "NOT_FLIGHT_RELATED" in decision:
-            if self._keyword_fallback_is_flight_related(text):
-                self._debug_log("reasoning.overridden_by_keyword_fallback=true")
-                return True
-            return False
+        return cleaned
 
-        if "FLIGHT_RELATED" in decision:
-            return True
+    #endregion
 
-        return self._keyword_fallback_is_flight_related(text)
-
-    def _keyword_fallback_is_flight_related(self, text: str) -> bool:
-        lowered = text.lower()
-        if any(keyword in lowered for keyword in FLIGHT_KEYWORDS):
-            return True
-
-        tokens = [token.strip(".,!?()[]{}") for token in text.split()]
-        iata_like_tokens = [token for token in tokens if len(token) == 3 and token.isalpha()]
-        return len(iata_like_tokens) >= 2
-
-    def _debug_log(self, message: str) -> None:
-        if not self._answer_core.config.debug_enabled:
-            return
-        print(f"[BookingAgent DEBUG] {message}")
-
-    def _shorten_for_debug(self, text: str, max_len: int = 240) -> str:
-        if len(text) <= max_len:
-            return text
-        return text[:max_len] + "..."
+    #region Tool handler methods for flight discovery, dates, and pricing
 
     def _tool_search_flights(
         self,
@@ -975,6 +1091,13 @@ class FlightTicketBookingAgent:
         destination: str,
         date: str,
     ) -> SearchFlightsToolResult:
+        """Search flights for a route/date and include nearby date alternatives.
+
+        Parameters:
+            origin: Origin city or IATA code.
+            destination: Destination city or IATA code.
+            date: Requested travel date or natural-language date phrase.
+        """
         origin_code = self._normalize_location_code(origin)
         destination_code = self._normalize_location_code(destination)
         normalized_date = self._normalize_date_value(date)
@@ -1018,6 +1141,14 @@ class FlightTicketBookingAgent:
         earliest_date: str | None = None,
         limit: int = 10,
     ) -> ListAvailableFlightsToolResult:
+        """List available flights with optional route/date filters.
+
+        Parameters:
+            origin: Optional origin city or IATA code filter.
+            destination: Optional destination city or IATA code filter.
+            earliest_date: Optional lower-bound date (or resolvable phrase).
+            limit: Maximum number of rows to return, clamped to [1, 25].
+        """
         origin_code = self._normalize_location_code(origin) if origin else None
         destination_code = self._normalize_location_code(destination) if destination else None
 
@@ -1053,104 +1184,12 @@ class FlightTicketBookingAgent:
         self._cache_set(cache_key, result)
         return result
 
-    def _fetch_matching_flights(
-        self,
-        origin_code: str,
-        destination_code: str,
-        travel_date: str,
-    ) -> list[FlightRow]:
-        rows = self._rest_get(
-            table=self._supabase["flights_table"],
-            query={
-                "select": (
-                    "flight_id,airline,origin,destination,date,depart_time,"
-                    "arrive_time,base_fare_usd,seats_left"
-                ),
-                "origin": f"eq.{origin_code}",
-                "destination": f"eq.{destination_code}",
-                "date": f"eq.{travel_date}",
-                "seats_left": "gt.0",
-                "order": "depart_time.asc,flight_id.asc",
-            },
-        )
-        return [self._row_to_flight(row) for row in rows]
-
-    def _fetch_available_flights(
-        self,
-        origin_code: str | None,
-        destination_code: str | None,
-        earliest_date: str | None,
-        limit: int,
-    ) -> list[FlightRow]:
-        query: dict[str, str] = {
-            "select": (
-                "flight_id,airline,origin,destination,date,depart_time,"
-                "arrive_time,base_fare_usd,seats_left"
-            ),
-            "seats_left": "gt.0",
-            "order": "date.asc,depart_time.asc,flight_id.asc",
-            "limit": str(limit),
-        }
-        if origin_code is not None:
-            query["origin"] = f"eq.{origin_code}"
-        if destination_code is not None:
-            query["destination"] = f"eq.{destination_code}"
-        if earliest_date is not None:
-            query["date"] = f"gte.{earliest_date}"
-
-        rows = self._rest_get(table=self._supabase["flights_table"], query=query)
-        return [self._row_to_flight(row) for row in rows]
-
-    def _find_next_available_dates(
-        self,
-        origin_code: str,
-        destination_code: str,
-        from_date: str,
-        max_dates: int,
-    ) -> list[str]:
-        cache_key = f"next-dates:{origin_code}:{destination_code}:{from_date}:{max_dates}"
-        cached = self._cache_get(cache_key)
-        if cached is not None:
-            return cast(list[str], cached)
-
-        rows = self._rest_get(
-            table=self._supabase["flights_table"],
-            query={
-                "select": "date",
-                "origin": f"eq.{origin_code}",
-                "destination": f"eq.{destination_code}",
-                "date": f"gte.{from_date}",
-                "seats_left": "gt.0",
-                "order": "date.asc",
-                "limit": "100",
-            },
-        )
-
-        seen_dates: set[str] = set()
-        next_dates: list[str] = []
-        for row in rows:
-            date_value = str(row.get("date", ""))
-            if not date_value or date_value in seen_dates:
-                continue
-            seen_dates.add(date_value)
-            next_dates.append(date_value)
-            if len(next_dates) >= max_dates:
-                break
-
-        self._cache_set(cache_key, next_dates)
-        return next_dates
-
-    def _serialize_flight(self, flight: FlightRow) -> FlightToolResult:
-        return {
-            "flight_id": flight["flight_id"],
-            "airline": flight["airline"],
-            "depart_time": flight["depart_time"],
-            "arrive_time": flight["arrive_time"],
-            "base_fare_usd": int(flight["base_fare_usd"]),
-            "seats_left": int(flight["seats_left"]),
-        }
-
     def _tool_resolve_travel_date(self, date_expression: str) -> ResolveDateToolResult:
+        """Resolve and validate a natural-language date expression.
+
+        Parameters:
+            date_expression: Human-friendly date expression such as "today".
+        """
         normalized_date = self._normalize_date_value(date_expression)
         self._validate_date(normalized_date)
         return {
@@ -1160,6 +1199,7 @@ class FlightTicketBookingAgent:
         }
 
     def _tool_get_current_system_date(self) -> CurrentSystemDateToolResult:
+        """Return the current UTC date in a structured response payload."""
         current_date = datetime.utcnow().date().isoformat()
         return {
             "current_date": current_date,
@@ -1168,6 +1208,12 @@ class FlightTicketBookingAgent:
         }
 
     def _tool_quote_fare(self, flight_id: str, cabin_class: str) -> FareQuoteToolResult:
+        """Quote final fare for a given flight and cabin class.
+
+        Parameters:
+            flight_id: Flight identifier to quote.
+            cabin_class: Cabin class key (`economy`, `premium_economy`, `business`).
+        """
         flight = self._require_flight(flight_id)
         multiplier = self._fare_multiplier(cabin_class)
         final_fare = int(round(int(flight["base_fare_usd"]) * multiplier))
@@ -1179,10 +1225,19 @@ class FlightTicketBookingAgent:
             "final_fare_usd": final_fare,
         }
 
+    #endregion
+
+    #region Tool handler methods for booking lifecycle
+
     def _tool_get_flight_by_id(
         self,
         flight_id: str,
     ) -> FlightDetailsToolResult | FlightNotFoundToolResult:
+        """Return flight details for a flight ID, or a not-found payload.
+
+        Parameters:
+            flight_id: Flight identifier supplied by the user.
+        """
         key = flight_id.strip().upper()
         if not key:
             return {
@@ -1216,6 +1271,13 @@ class FlightTicketBookingAgent:
         passenger_name: str,
         cabin_class: str,
     ) -> BookingRecord | FailedBookingToolResult:
+        """Create a confirmed booking and decrement available seats.
+
+        Parameters:
+            flight_id: Flight identifier to book.
+            passenger_name: Passenger name saved in booking record.
+            cabin_class: Cabin class key used for fare quoting.
+        """
         flight = self._require_flight(flight_id)
         if int(flight["seats_left"]) <= 0:
             return {"status": "failed", "reason": "No seats left for this flight."}
@@ -1256,6 +1318,11 @@ class FlightTicketBookingAgent:
         self,
         booking_id: str,
     ) -> BookingRecord | BookingNotFoundToolResult:
+        """Retrieve one booking by ID with cache acceleration.
+
+        Parameters:
+            booking_id: Booking identifier, case-insensitive.
+        """
         booking_key = booking_id.strip().upper()
         cache_key = f"booking:{booking_key}"
         cached = self._cache_get(cache_key)
@@ -1287,6 +1354,11 @@ class FlightTicketBookingAgent:
         self,
         booking_id: str,
     ) -> BookingRecord | BookingNotFoundToolResult:
+        """Cancel a booking and return one seat to the associated flight.
+
+        Parameters:
+            booking_id: Identifier of the booking to cancel.
+        """
         booking_lookup = self._tool_get_booking(booking_id)
         if isinstance(booking_lookup, dict) and booking_lookup.get("status") == "not_found":
             return booking_lookup
@@ -1313,7 +1385,126 @@ class FlightTicketBookingAgent:
         self._cache_clear()
         return booking
 
+    #endregion
+
+    #region Data access helper methods for flights and availability
+
+    def _fetch_matching_flights(
+        self,
+        origin_code: str,
+        destination_code: str,
+        travel_date: str,
+    ) -> list[FlightRow]:
+        """Fetch flights matching exact route/date with seats available.
+
+        Parameters:
+            origin_code: Normalized IATA-like origin code.
+            destination_code: Normalized IATA-like destination code.
+            travel_date: Validated ISO travel date in YYYY-MM-DD format.
+        """
+        rows = self._rest_get(
+            table=self._supabase["flights_table"],
+            query={
+                "select": (
+                    "flight_id,airline,origin,destination,date,depart_time,"
+                    "arrive_time,base_fare_usd,seats_left"
+                ),
+                "origin": f"eq.{origin_code}",
+                "destination": f"eq.{destination_code}",
+                "date": f"eq.{travel_date}",
+                "seats_left": "gt.0",
+                "order": "depart_time.asc,flight_id.asc",
+            },
+        )
+        return [self._row_to_flight(row) for row in rows]
+
+    def _fetch_available_flights(
+        self,
+        origin_code: str | None,
+        destination_code: str | None,
+        earliest_date: str | None,
+        limit: int,
+    ) -> list[FlightRow]:
+        """Fetch flights with optional filters and deterministic ordering.
+
+        Parameters:
+            origin_code: Optional normalized origin filter.
+            destination_code: Optional normalized destination filter.
+            earliest_date: Optional lower-bound date filter.
+            limit: Maximum number of records requested from Supabase.
+        """
+        query: dict[str, str] = {
+            "select": (
+                "flight_id,airline,origin,destination,date,depart_time,"
+                "arrive_time,base_fare_usd,seats_left"
+            ),
+            "seats_left": "gt.0",
+            "order": "date.asc,depart_time.asc,flight_id.asc",
+            "limit": str(limit),
+        }
+        if origin_code is not None:
+            query["origin"] = f"eq.{origin_code}"
+        if destination_code is not None:
+            query["destination"] = f"eq.{destination_code}"
+        if earliest_date is not None:
+            query["date"] = f"gte.{earliest_date}"
+
+        rows = self._rest_get(table=self._supabase["flights_table"], query=query)
+        return [self._row_to_flight(row) for row in rows]
+
+    def _find_next_available_dates(
+        self,
+        origin_code: str,
+        destination_code: str,
+        from_date: str,
+        max_dates: int,
+    ) -> list[str]:
+        """Find distinct upcoming dates with availability for a route.
+
+        Parameters:
+            origin_code: Normalized origin code.
+            destination_code: Normalized destination code.
+            from_date: Inclusive lower bound in YYYY-MM-DD format.
+            max_dates: Maximum number of distinct dates to return.
+        """
+        cache_key = f"next-dates:{origin_code}:{destination_code}:{from_date}:{max_dates}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cast(list[str], cached)
+
+        rows = self._rest_get(
+            table=self._supabase["flights_table"],
+            query={
+                "select": "date",
+                "origin": f"eq.{origin_code}",
+                "destination": f"eq.{destination_code}",
+                "date": f"gte.{from_date}",
+                "seats_left": "gt.0",
+                "order": "date.asc",
+                "limit": "100",
+            },
+        )
+
+        seen_dates: set[str] = set()
+        next_dates: list[str] = []
+        for row in rows:
+            date_value = str(row.get("date", ""))
+            if not date_value or date_value in seen_dates:
+                continue
+            seen_dates.add(date_value)
+            next_dates.append(date_value)
+            if len(next_dates) >= max_dates:
+                break
+
+        self._cache_set(cache_key, next_dates)
+        return next_dates
+
     def _require_flight(self, flight_id: str) -> FlightRow:
+        """Load a flight by ID or raise when no matching row exists.
+
+        Parameters:
+            flight_id: Flight identifier to look up.
+        """
         key = flight_id.strip().upper()
         cache_key = f"flight:{key}"
         cached = self._cache_get(cache_key)
@@ -1339,6 +1530,12 @@ class FlightTicketBookingAgent:
         return flight
 
     def _update_flight_seats(self, flight_id: str, seats_left: int) -> None:
+        """Persist a flight seat-count update with non-negative clamping.
+
+        Parameters:
+            flight_id: Flight identifier to update.
+            seats_left: Desired seat count before clamping at zero.
+        """
         self._rest_patch(
             table=self._supabase["flights_table"],
             query={"flight_id": f"eq.{flight_id}"},
@@ -1346,6 +1543,11 @@ class FlightTicketBookingAgent:
         )
 
     def _fare_multiplier(self, cabin_class: str) -> float:
+        """Resolve cabin class to fare multiplier used in price quoting.
+
+        Parameters:
+            cabin_class: Cabin class key expected by booking tools.
+        """
         normalized = cabin_class.strip().lower()
         multipliers = {
             "economy": 1.0,
@@ -1358,13 +1560,27 @@ class FlightTicketBookingAgent:
             )
         return multipliers[normalized]
 
+    #endregion
+
+    #region Normalization and validation helper methods
+
     def _validate_date(self, date_value: str) -> None:
+        """Validate that a date string conforms to YYYY-MM-DD format.
+
+        Parameters:
+            date_value: Date string to validate.
+        """
         try:
             datetime.strptime(date_value, "%Y-%m-%d")
         except ValueError as exc:
             raise ValueError("date must be in YYYY-MM-DD format.") from exc
 
     def _normalize_date_value(self, raw_date: str) -> str:
+        """Normalize date phrases to ISO format when a resolver matches.
+
+        Parameters:
+            raw_date: Raw date text provided by user or tool invocation.
+        """
         normalized = raw_date.strip().lower()
         today = datetime.utcnow().date()
 
@@ -1385,6 +1601,12 @@ class FlightTicketBookingAgent:
         normalized: str,
         today: date,
     ) -> str | None:
+        """Resolve exact keywords `today`/`tomorrow` into ISO date strings.
+
+        Parameters:
+            normalized: Lower-cased date phrase.
+            today: Current date used as calculation base.
+        """
         if normalized == "today":
             return today.isoformat()
         if normalized == "tomorrow":
@@ -1396,6 +1618,12 @@ class FlightTicketBookingAgent:
         normalized: str,
         today: date,
     ) -> str | None:
+        """Resolve phrases like `15th of march [2026]` into ISO date.
+
+        Parameters:
+            normalized: Lower-cased date phrase.
+            today: Current date used for default year when omitted.
+        """
         of_month_match = DAY_OF_MONTH_PATTERN.fullmatch(normalized)
         if of_month_match is None:
             return None
@@ -1410,6 +1638,12 @@ class FlightTicketBookingAgent:
         normalized: str,
         today: date,
     ) -> str | None:
+        """Resolve phrases like `march 15 [2026]` into ISO date.
+
+        Parameters:
+            normalized: Lower-cased date phrase.
+            today: Current date used for default year when omitted.
+        """
         month_day_match = MONTH_DAY_PATTERN.fullmatch(normalized)
         if month_day_match is None:
             return None
@@ -1424,6 +1658,12 @@ class FlightTicketBookingAgent:
         normalized: str,
         today: date,
     ) -> str | None:
+        """Resolve relative phrases such as `3 days from today`.
+
+        Parameters:
+            normalized: Lower-cased date phrase.
+            today: Current date used as calculation base.
+        """
         relative_match = RELATIVE_DAYS_PATTERN.fullmatch(normalized)
         if relative_match is not None:
             return (today + timedelta(days=int(relative_match.group(1)))).isoformat()
@@ -1438,12 +1678,24 @@ class FlightTicketBookingAgent:
         return (today + timedelta(days=offset_days)).isoformat()
 
     def _compose_iso_date(self, month_name: str, day: int, year: int) -> str | None:
+        """Compose an ISO date from month/day/year components.
+
+        Parameters:
+            month_name: Lower-cased month name looked up in month mapping.
+            day: Day of month value.
+            year: Four-digit year.
+        """
         month_number = MONTH_NAME_TO_NUMBER.get(month_name)
         if month_number is None:
             return None
         return datetime(year, month_number, day).date().isoformat()
 
     def _normalize_location_code(self, location_text: str) -> str:
+        """Normalize city text or IATA-like code to uppercase location code.
+
+        Parameters:
+            location_text: User-provided city name or code candidate.
+        """
         normalized = location_text.strip().lower()
         if not normalized:
             raise ValueError("Location cannot be empty.")
@@ -1476,7 +1728,31 @@ class FlightTicketBookingAgent:
         self._cache_set(cache_key, fallback)
         return fallback
 
+    #endregion
+
+    #region Serialization, caching, and Supabase proxy methods
+
+    def _serialize_flight(self, flight: FlightRow) -> FlightToolResult:
+        """Project a full flight row into the public tool response shape.
+
+        Parameters:
+            flight: Internal flight row dictionary.
+        """
+        return {
+            "flight_id": flight["flight_id"],
+            "airline": flight["airline"],
+            "depart_time": flight["depart_time"],
+            "arrive_time": flight["arrive_time"],
+            "base_fare_usd": int(flight["base_fare_usd"]),
+            "seats_left": int(flight["seats_left"]),
+        }
+
     def _row_to_flight(self, row: dict[str, object]) -> FlightRow:
+        """Convert a generic Supabase row into a typed internal flight row.
+
+        Parameters:
+            row: Dictionary payload returned from Supabase.
+        """
         return {
             "flight_id": str(row.get("flight_id", "")),
             "airline": str(row.get("airline", "")),
@@ -1490,6 +1766,11 @@ class FlightTicketBookingAgent:
         }
 
     def _row_to_booking(self, row: dict[str, object]) -> BookingRecord:
+        """Convert a generic Supabase row into a typed booking record.
+
+        Parameters:
+            row: Dictionary payload returned from Supabase.
+        """
         return {
             "booking_id": str(row.get("booking_id", "")),
             "status": cast(Literal["confirmed", "cancelled"], str(row.get("status", "confirmed"))),
@@ -1508,6 +1789,11 @@ class FlightTicketBookingAgent:
         }
 
     def _cache_get(self, key: str) -> object | None:
+        """Return a deep-copied cached value and refresh its LRU position.
+
+        Parameters:
+            key: Cache entry key.
+        """
         value = self._result_cache.get(key)
         if value is None:
             return None
@@ -1515,15 +1801,28 @@ class FlightTicketBookingAgent:
         return json.loads(json.dumps(value))
 
     def _cache_set(self, key: str, value: object) -> None:
+        """Store a deep-copied value in LRU cache and enforce max size.
+
+        Parameters:
+            key: Cache entry key.
+            value: JSON-serializable object to store.
+        """
         self._result_cache[key] = json.loads(json.dumps(value))
         self._result_cache.move_to_end(key)
         if len(self._result_cache) > self._result_cache_max_size:
             self._result_cache.popitem(last=False)
 
     def _cache_clear(self) -> None:
+        """Remove all in-memory cached tool/query results."""
         self._result_cache.clear()
 
     def _rest_get(self, table: str, query: dict[str, str]) -> list[dict[str, object]]:
+        """Proxy GET request to Supabase client.
+
+        Parameters:
+            table: Target table name.
+            query: PostgREST query parameter mapping.
+        """
         return self._supabase_client.get(table=table, query=query)
 
     def _rest_post(
@@ -1532,10 +1831,51 @@ class FlightTicketBookingAgent:
         body: object,
         query: dict[str, str] | None,
     ) -> object:
+        """Proxy POST request to Supabase client.
+
+        Parameters:
+            table: Target table name.
+            body: JSON-serializable request payload.
+            query: Optional PostgREST query parameters.
+        """
         return self._supabase_client.post(table=table, body=body, query=query)
 
     def _rest_patch(self, table: str, query: dict[str, str], body: dict[str, object]) -> object:
+        """Proxy PATCH request to Supabase client.
+
+        Parameters:
+            table: Target table name.
+            query: PostgREST filters selecting rows to patch.
+            body: JSON patch payload.
+        """
         return self._supabase_client.patch(table=table, query=query, body=body)
+
+    #endregion
+
+    #region Debug and diagnostics methods
+
+    def _debug_log(self, message: str) -> None:
+        """Emit a prefixed debug log line when debug mode is enabled.
+
+        Parameters:
+            message: Diagnostic message to print.
+        """
+        if not self._answer_core.config.debug_enabled:
+            return
+        print(f"[BookingAgent DEBUG] {message}")
+
+    def _shorten_for_debug(self, text: str, max_len: int = 240) -> str:
+        """Truncate long debug text payloads to keep logs readable.
+
+        Parameters:
+            text: Full text payload to potentially shorten.
+            max_len: Maximum allowed length before ellipsis is appended.
+        """
+        if len(text) <= max_len:
+            return text
+        return text[:max_len] + "..."
+
+    #endregion
 
 
 def run_cli() -> None:
