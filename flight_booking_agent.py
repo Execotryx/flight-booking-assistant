@@ -729,6 +729,7 @@ class FlightTicketBookingAgent:
                 reasoning_model_name=REASONING_MODEL_NAME,
                 reasoning_base_url=self._reasoning_core.config.base_url,
                 reasoning_api_key=self._reasoning_core.config.openai_api_key,
+                debug_log=self._debug_log,
             )
         self._register_tools()
 

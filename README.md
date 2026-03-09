@@ -2,6 +2,11 @@
 
 A flight-only booking assistant that uses an Ollama-compatible API and tool calling.
 
+## Warning
+
+This project is a prototype for learning and experimentation.
+Do not use it as-is in production environments.
+
 The assistant is domain-restricted to flight booking and travel tasks. It can search flights, quote fares, create/cancel bookings, and answer follow-up questions using live tool data from Supabase.
 
 After a successful booking, it can also generate a destination postcard image using DALL-E 3.
