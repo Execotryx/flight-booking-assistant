@@ -13,12 +13,12 @@ import urllib.request
 import uuid
 from collections import OrderedDict
 from datetime import date, datetime, timedelta
-from typing import Callable, Literal, TypedDict, cast
+from typing import Callable, Literal, NotRequired, Protocol, TypedDict, cast
 
 from dotenv import dotenv_values
-
 from ai_config import AIConfig
 from ollama_core import OllamaAICore
+from postcard_generator import PostcardGenerationResult, PostcardGenerator
 
 #region Constants and configuration
 
@@ -30,7 +30,6 @@ DEFAULT_SUPABASE_FLIGHTS_TABLE: str = "flights"
 DEFAULT_SUPABASE_LOOKUP_TABLE: str = "city_code_lookup"
 DEFAULT_SUPABASE_BOOKINGS_TABLE: str = "bookings"
 DEFAULT_SUPABASE_RESULT_CACHE_SIZE: int = 5
-
 FLIGHT_KEYWORDS: frozenset[str] = frozenset(
     {
         "flight",
@@ -93,6 +92,7 @@ MONTH_DAY_PATTERN = re.compile(
 RELATIVE_DAYS_PATTERN = re.compile(r"(\d+)\s+days?\s+from\s+today")
 WORD_RELATIVE_DAYS_PATTERN = re.compile(r"([a-z]+)\s+days?\s+from\s+today")
 IATA_CODE_PATTERN = re.compile(r"\b[A-Za-z]{3}\b")
+FLIGHT_ID_PATTERN = re.compile(r"\bFL-\d+\b", flags=re.IGNORECASE)
 ORIGIN_HINT_PATTERN = re.compile(r"\bfrom\s+([a-z]{3,}(?:\s+[a-z]{2,})?)\b")
 TRAILING_ORIGIN_FILLER_WORDS: frozenset[str] = frozenset(
     {
@@ -142,7 +142,11 @@ Scope and policy:
 
 Booking behavior:
 - Be concise and practical.
-- Ask for missing required details before booking: origin, destination, date, passenger name.
+- Ask only for missing details before booking; do not ask for fields that are already known.
+- If a valid `flight_id` is already known (or user says "this flight" right after results), do not ask
+    again for origin/destination/date. Use `get_flight_by_id` when needed to confirm flight details.
+- For `create_booking`, the required inputs are `flight_id`, `passenger_name`, and `cabin_class`.
+    Collect only those missing inputs.
 - For non-ISO date phrases (for example, "two days from today"), first call
     `get_current_system_date` if needed for reference, then call `resolve_travel_date`, and
     finally use the resolved YYYY-MM-DD value in booking tools.
@@ -179,6 +183,22 @@ class BookingRecord(TypedDict):
     arrive_time: str
     cabin_class: str
     paid_fare_usd: int
+    postcard: NotRequired["PostcardToolResult"]
+
+
+PostcardToolResult = PostcardGenerationResult
+
+
+class PostcardGeneratorProtocol(Protocol):
+    """Interface for postcard generation dependency injection."""
+
+    def generate_postcard(
+        self,
+        booking_id: str,
+        destination_city: str,
+    ) -> PostcardGenerationResult:
+        """Generate postcard artifacts for a confirmed booking."""
+        ...
 
 
 class FlightRow(TypedDict):
@@ -623,6 +643,28 @@ TOOL_TEMPLATES: tuple[ToolTemplate, ...] = (
         "handler_name": "_tool_create_booking",
     },
     {
+        "name": "generate_destination_postcard",
+        "description": (
+            "Generate a destination postcard image with DALL-E 3 only for an existing "
+            "confirmed booking."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "booking_id": {
+                    "type": "string",
+                    "description": "Confirmed booking ID to validate generation eligibility.",
+                },
+                "destination_city": {
+                    "type": "string",
+                    "description": "Destination city name used to craft a postcard prompt.",
+                },
+            },
+            "required": ["booking_id", "destination_city"],
+        },
+        "handler_name": "_tool_generate_destination_postcard",
+    },
+    {
         "name": "get_booking",
         "description": "Retrieve details for an existing booking.",
         "parameters": {
@@ -651,12 +693,18 @@ class FlightTicketBookingAgent:
 
     #region Lifecycle and tool registration methods
 
-    def __init__(self, config: AIConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: AIConfig | None = None,
+        postcard_generator: PostcardGeneratorProtocol | None = None,
+    ) -> None:
         """Initialize agent models, Supabase client, and in-memory state.
 
         Parameters:
             config: Optional runtime AI configuration used for both reasoning and
                 answering cores. When omitted, default AIConfig behavior is used.
+            postcard_generator: Optional postcard generator dependency. When omitted,
+                a default `PostcardGenerator` is constructed.
         """
         self._reasoning_core = self._create_reasoning_core(config)
         self._answer_core = self._create_answer_core(config)
@@ -672,6 +720,16 @@ class FlightTicketBookingAgent:
 
         self._booking_flow_active: bool = False
         self._last_search_context: SearchContext | None = None
+        self._last_presented_flight_ids: list[str] = []
+        self._latest_postcard: PostcardToolResult | None = None
+        if postcard_generator is not None:
+            self._postcard_generator = postcard_generator
+        else:
+            self._postcard_generator = PostcardGenerator(
+                reasoning_model_name=REASONING_MODEL_NAME,
+                reasoning_base_url=self._reasoning_core.config.base_url,
+                reasoning_api_key=self._reasoning_core.config.openai_api_key,
+            )
         self._register_tools()
 
     def _create_reasoning_core(self, config: AIConfig | None) -> OllamaAICore:
@@ -828,9 +886,22 @@ class FlightTicketBookingAgent:
             return deterministic_follow_up
 
         self._debug_log("routing=FLIGHT_RELATED (allowed)")
-        answer = self._sanitize_answer_output(self._answer_core.ask(user_input))
+        enriched_input = self._maybe_enrich_booking_input(user_input)
+        answer = self._sanitize_answer_output(self._answer_core.ask(enriched_input))
         self._debug_log(f"answer={self._shorten_for_debug(answer)}")
         return answer
+
+    def get_latest_postcard_path(self) -> str | None:
+        """Return local image path for the most recently generated destination postcard."""
+        if self._latest_postcard is None:
+            return None
+        return self._latest_postcard.get("image_path")
+
+    def get_latest_postcard(self) -> PostcardToolResult | None:
+        """Return the most recent postcard generation payload for UI integration."""
+        if self._latest_postcard is None:
+            return None
+        return cast(PostcardToolResult, json.loads(json.dumps(self._latest_postcard)))
 
     #endregion
 
@@ -1042,7 +1113,14 @@ class FlightTicketBookingAgent:
         """
         flights = availability["flights"]
         if not flights:
+            self._last_presented_flight_ids = []
             return empty_message
+
+        self._last_presented_flight_ids = [
+            str(flight["flight_id"]).strip().upper()
+            for flight in flights
+            if str(flight.get("flight_id", "")).strip()
+        ]
 
         lines = ["Here are available flights:"]
         for flight in flights:
@@ -1054,6 +1132,50 @@ class FlightTicketBookingAgent:
                 )
             )
         return "\n".join(lines)
+
+    def _maybe_enrich_booking_input(self, user_input: str) -> str:
+        """Attach a known flight_id when user refers to "this flight" in booking intent.
+
+        This reduces ambiguous follow-ups where the user asks to book the most recently
+        shown single option without repeating its identifier.
+        """
+        text = user_input.strip()
+        lowered = text.lower()
+
+        has_booking_intent = any(
+            token in lowered
+            for token in ("book", "booking", "reserve", "ticket")
+        )
+        if not has_booking_intent:
+            return text
+
+        if FLIGHT_ID_PATTERN.search(text):
+            return text
+
+        refers_to_previous_option = any(
+            phrase in lowered
+            for phrase in (
+                "this flight",
+                "that flight",
+                "book it",
+                "this one",
+                "that one",
+                "same flight",
+            )
+        )
+        if not refers_to_previous_option:
+            return text
+
+        if len(self._last_presented_flight_ids) != 1:
+            return text
+
+        inferred_flight_id = self._last_presented_flight_ids[0]
+        enriched = (
+            f"{text}\n\n"
+            f"Known flight_id from immediate prior options: {inferred_flight_id}."
+        )
+        self._debug_log(f"booking.input_enriched_with_flight_id={inferred_flight_id}")
+        return enriched
 
     def _sanitize_answer_output(self, answer: str) -> str:
         """Normalize model output and remove accidental wrapper tags.
@@ -1312,7 +1434,54 @@ class FlightTicketBookingAgent:
         self._cache_clear()
         self._update_flight_seats(flight_id=flight["flight_id"], seats_left=max(0, int(flight["seats_left"]) - 1))
 
+        postcard_destination = self._city_name_from_iata(flight["destination"])
+        postcard_result = self._tool_generate_destination_postcard(
+            booking_id=booking_id,
+            destination_city=postcard_destination,
+        )
+        booking_record["postcard"] = postcard_result
+
         return booking_record
+
+    def _tool_generate_destination_postcard(
+        self,
+        booking_id: str,
+        destination_city: str,
+    ) -> PostcardToolResult:
+        """Generate a destination postcard image for a confirmed booking only.
+
+        Parameters:
+            booking_id: Confirmed booking identifier used as generation gate.
+            destination_city: City used for prompt construction.
+        """
+        booking_lookup = self._tool_get_booking(booking_id)
+        if isinstance(booking_lookup, dict) and booking_lookup.get("status") == "not_found":
+            failure = self._postcard_failure(
+                booking_id=booking_id,
+                destination_city=destination_city,
+                prompt="",
+                message="Postcard generation is allowed only for confirmed bookings.",
+            )
+            self._latest_postcard = failure
+            return failure
+
+        booking = cast(BookingRecord, booking_lookup)
+        if booking["status"] != "confirmed":
+            failure = self._postcard_failure(
+                booking_id=booking_id,
+                destination_city=destination_city,
+                prompt="",
+                message="Booking is not confirmed. Postcard generation was skipped.",
+            )
+            self._latest_postcard = failure
+            return failure
+
+        postcard_result = self._postcard_generator.generate_postcard(
+            booking_id=booking_id,
+            destination_city=destination_city,
+        )
+        self._latest_postcard = postcard_result
+        return postcard_result
 
     def _tool_get_booking(
         self,
@@ -1727,6 +1896,40 @@ class FlightTicketBookingAgent:
         fallback = location_text.strip().upper()
         self._cache_set(cache_key, fallback)
         return fallback
+
+    def _city_name_from_iata(self, iata_code: str) -> str:
+        """Resolve an IATA code to city name for postcard prompt quality."""
+        normalized_code = iata_code.strip().upper()
+        rows = self._rest_get(
+            table=self._supabase["lookup_table"],
+            query={
+                "select": "city_name",
+                "iata_code": f"eq.{normalized_code}",
+                "limit": "1",
+            },
+        )
+        if rows:
+            city_name = str(rows[0].get("city_name", "")).strip()
+            if city_name:
+                return city_name.title()
+        return normalized_code
+
+    def _postcard_failure(
+        self,
+        booking_id: str,
+        destination_city: str,
+        prompt: str,
+        message: str,
+    ) -> PostcardToolResult:
+        """Build a consistent postcard failure payload."""
+        return {
+            "status": "failed",
+            "booking_id": booking_id,
+            "destination_city": destination_city,
+            "prompt": prompt,
+            "image_path": None,
+            "message": message,
+        }
 
     #endregion
 

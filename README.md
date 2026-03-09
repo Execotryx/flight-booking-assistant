@@ -4,6 +4,8 @@ A flight-only booking assistant that uses an Ollama-compatible API and tool call
 
 The assistant is domain-restricted to flight booking and travel tasks. It can search flights, quote fares, create/cancel bookings, and answer follow-up questions using live tool data from Supabase.
 
+After a successful booking, it can also generate a destination postcard image using DALL-E 3.
+
 ## What It Does
 
 - Routes requests through a strict flight-domain classifier.
@@ -11,6 +13,7 @@ The assistant is domain-restricted to flight booking and travel tasks. It can se
 - Supports deterministic handling for common follow-ups such as:
   - "what flights from London are available"
   - "same route, but later date"
+- Generates a destination postcard image only when a booking is confirmed.
 - Provides both CLI and Gradio interfaces.
 
 ## Current Model Configuration
@@ -54,6 +57,7 @@ It also keeps a small in-memory response cache for recent tool results (default 
 - `quote_fare(flight_id, cabin_class)`
 - `get_flight_by_id(flight_id)`
 - `create_booking(flight_id, passenger_name, cabin_class)`
+- `generate_destination_postcard(booking_id, destination_city)`
 - `get_booking(booking_id)`
 - `cancel_booking(booking_id)`
 
@@ -91,6 +95,19 @@ OPENAI_BASE_URL=http://localhost:11434/v1
 
 SUPABASE_URL=https://<your-project-ref>.supabase.co
 SUPABASE_KEY=<your-supabase-key>
+
+# Required for DALL-E 3 postcard generation after successful bookings.
+DALLE_OPENAI_API_KEY=<your-openai-api-key>
+```
+
+Optional postcard generation variables:
+
+```env
+DALLE_MODEL_NAME=dall-e-3
+DALLE_IMAGE_SIZE=1024x1024
+POSTCARD_OUTPUT_DIR=generated_postcards
+# Optional when using a non-default OpenAI-compatible image endpoint
+DALLE_BASE_URL=
 ```
 
 Optional Supabase table and cache settings:
